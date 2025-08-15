@@ -1,111 +1,80 @@
 from flask import Flask, request, render_template_string, send_file
-from io import BytesIO
 from urllib.parse import urlsplit
+import tempfile
 import re
 import tldextract
 import idna
+import os
 
 app = Flask(__name__)
 
-PAGE = """
-<!doctype html>
+# ملف مؤقت لتخزين آخر نتيجة
+LAST_RESULT_FILE = None
+
+PAGE = """<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Bulk Domain Filter</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600&display=swap" rel="stylesheet">
-  <style>
-    body { font-family: 'Cairo', system-ui, -apple-system, Segoe UI, Roboto, Arial; background:#0f1115; color:#e8e8ea; }
-    .wrap { max-width: 960px; margin: 40px auto; padding: 24px; background: #161a22; border-radius: 16px; box-shadow: 0 6px 24px rgba(0,0,0,.25); }
-    h1 { margin-top: 0; font-weight: 700; font-size: 24px; }
-    .card { background:#0f1320; padding:16px; border-radius:12px; margin:12px 0; }
-    label { display:block; margin-bottom: 8px; font-weight:600; }
-    input[type=file], input[type=text] { width:100%; padding:10px; background:#0e1220; border:1px solid #2a3142; border-radius:10px; color:#cfd3dc; }
-    .row { display:grid; grid-template-columns: 1fr; gap:16px; }
-    .btn { cursor:pointer; padding:12px 18px; border-radius:12px; border:1px solid #2a3142; background:#3751ff; color:white; font-weight:700; }
-    .btn:disabled { opacity:.6; cursor:not-allowed; }
-    .opts { display:flex; gap:16px; flex-wrap:wrap; }
-    .muted { color:#a8b0c2; font-size:14px; }
-    .stat { background:#121725; padding:10px 12px; border:1px dashed #2a3142; border-radius:10px; display:inline-block; margin:6px 8px 0 0; }
-    a.download { display:inline-block; margin-top:12px; }
-    .footer { color:#8a91a6; font-size:12px; margin-top:24px; text-align:center; }
-    .footer a { color:#4da3ff; text-decoration:none; font-weight:600; }
-    .footer a:hover { text-decoration:underline; }
-  </style>
+<meta charset="utf-8" />
+<title>Bulk Domain Filter — Ultra Pro Max</title>
+<style>
+body { background:#0f1115; color:#e8e8ea; font-family: Arial, sans-serif; }
+.wrap { max-width: 900px; margin: 30px auto; padding: 20px; background:#161a22; border-radius: 12px; }
+h1 { margin-top: 0; }
+.card { background:#0f1320; padding:16px; border-radius:10px; margin:12px 0; }
+label { display:block; margin-bottom: 6px; font-weight: bold; }
+input[type=file], input[type=text] { width:100%; padding:8px; margin-bottom:10px; }
+.btn { background:#3751ff; border:none; color:#fff; padding:10px 16px; border-radius:8px; cursor:pointer; }
+.stat { display:inline-block; background:#121725; padding:6px 10px; margin:4px; border-radius:8px; }
+.footer { text-align:center; margin-top:20px; font-size:13px; }
+.footer a { color:#4da3ff; text-decoration:none; }
+</style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>🧹 Bulk Domain Filter & Normalizer</h1>
-    <form method="POST" enctype="multipart/form-data">
-      <div class="card">
-        <label for="files">Upload files (any count). Each line may be a domain, URL, or mixed text.</label>
-        <input id="files" name="files" type="file" multiple required accept=".txt,.csv">
-        <div class="muted">The tool scans every line in all files and extracts hostnames/domains.</div>
-      </div>
-      <div class="card">
-        <label>Filter (optional)</label>
-        <div class="opts" style="flex-direction:column;">
-          <input type="text" name="filter_domain" placeholder="e.g. google.com">
-          <label><input type="radio" name="filter_mode" value="endswith" checked> Match domain or subdomains (endswith)</label>
-          <label><input type="radio" name="filter_mode" value="exact"> Exact match only</label>
-        </div>
-        <div class="muted">If set, output will include only entries that match the filter.</div>
-      </div>
-      <div class="card">
-        <label>Options</label>
-        <div class="opts">
-          <label><input type="checkbox" name="to_lower" checked> Force lowercase</label>
-          <label><input type="checkbox" name="trim_spaces" checked> Trim spaces</label>
-          <label><input type="checkbox" name="ignore_comments" checked> Ignore comment lines starting with # or //</label>
-          <label><input type="checkbox" name="keep_root" checked> Reduce to registered/root domain</label>
-          <label><input type="checkbox" name="drop_private"> Drop private suffixes</label>
-          <label><input type="checkbox" name="unique_only" checked> Unique only (de‑duplicate)</label>
-          <label><input type="checkbox" name="sort_output"> Sort output (A→Z)</label>
-          <label><input type="checkbox" name="keep_invalid"> Keep invalid tokens</label>
-        </div>
-      </div>
-      <button class="btn" type="submit">Process & Download</button>
-    </form>
+<div class="wrap">
+<h1>🧹 Bulk Domain Filter & Normalizer — Ultra Pro Max</h1>
+<form method="POST" enctype="multipart/form-data">
+<div class="card">
+<label>Upload files:</label>
+<input type="file" name="files" multiple required>
+</div>
+<div class="card">
+<label>Filter (optional)</label>
+<input type="text" name="filter_domain" placeholder="e.g. google.com">
+<label><input type="radio" name="filter_mode" value="endswith" checked> Match domain or subdomains</label>
+<label><input type="radio" name="filter_mode" value="exact"> Exact match only</label>
+</div>
+<div class="card">
+<label>Options</label>
+<label><input type="checkbox" name="to_lower" checked> Force lowercase</label>
+<label><input type="checkbox" name="trim_spaces" checked> Trim spaces</label>
+<label><input type="checkbox" name="ignore_comments" checked> Ignore comment lines</label>
+<label><input type="checkbox" name="keep_root" checked> Reduce to registered/root domain</label>
+<label><input type="checkbox" name="unique_only" checked> Unique only</label>
+<label><input type="checkbox" name="sort_output"> Sort output</label>
+<label><input type="checkbox" name="keep_invalid"> Keep invalid tokens</label>
+</div>
+<button class="btn" type="submit">Process & Download</button>
+</form>
 
-    {% if stats %}
-    <div class="card" style="margin-top:16px;">
-      <div class="stat">Files: <b>{{stats.files}}</b></div>
-      <div class="stat">Total lines scanned: <b>{{stats.total_lines}}</b></div>
-      <div class="stat">Valid hosts: <b>{{stats.valid}}</b></div>
-      <div class="stat">Unique after rules: <b>{{stats.unique}}</b></div>
-      <div class="stat">Matched filter: <b>{{stats.matched}}</b></div>
-      {% if stats.invalid %}<div class="stat">Invalid tokens: <b>{{stats.invalid}}</b></div>{% endif %}
-      <a class="download btn" href="/download" download>⬇️ Download Result</a>
-    </div>
-    {% endif %}
+{% if stats %}
+<div class="card">
+<div class="stat">Files: {{stats.files}}</div>
+<div class="stat">Total lines: {{stats.total_lines}}</div>
+<div class="stat">Valid: {{stats.valid}}</div>
+<div class="stat">Matched: {{stats.matched}}</div>
+<div class="stat">Unique: {{stats.unique}}</div>
+<a class="btn" href="/download">⬇️ Download Result</a>
+</div>
+{% endif %}
 
-    <div class="footer">BY <a href="https://t.me/JOOxCRACK" target="_blank">@JOOxCRACK</a></div>
-  </div>
+<div class="footer">BY <a href="https://t.me/JOOxCRACK" target="_blank">@JOOxCRACK</a></div>
+</div>
 </body>
-</html>
-"""
+</html>"""
 
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
 
-
-def _read_text(file_storage, try_encodings=("utf-8", "utf-8-sig", "cp1256", "latin-1")):
-    data = file_storage.read()
-    try:
-        file_storage.seek(0)
-    except Exception:
-        pass
-    for enc in try_encodings:
-        try:
-            return data.decode(enc)
-        except Exception:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
-def _extract_host(token: str) -> str | None:
+def extract_host(token: str):
     s = token.strip()
     if not s:
         return None
@@ -113,7 +82,7 @@ def _extract_host(token: str) -> str | None:
         try:
             parts = urlsplit(s)
             host = parts.hostname
-        except Exception:
+        except:
             host = None
     else:
         host = s.split()[0]
@@ -128,35 +97,23 @@ def _extract_host(token: str) -> str | None:
         host = host[4:]
     return host
 
-
-def _is_valid_domain(host: str) -> bool:
-    if not HOST_RE.match(host):
-        return False
-    if host.startswith('.') or host.endswith('.'):
-        return False
-    if '..' in host:
-        return False
-    if '.' not in host:
-        return False
+def is_valid_domain(host: str) -> bool:
+    if not HOST_RE.match(host): return False
+    if host.startswith('.') or host.endswith('.'): return False
+    if '..' in host: return False
+    if '.' not in host: return False
     try:
         idna.encode(host)
         return True
-    except Exception:
+    except:
         return False
-
-
-_LAST_RESULT: bytes | None = None
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}, 200
-
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    global _LAST_RESULT
+    global LAST_RESULT_FILE
     if request.method == "GET":
         return render_template_string(PAGE)
+
     to_lower = bool(request.form.get("to_lower"))
     trim_spaces = bool(request.form.get("trim_spaces"))
     ignore_comments = bool(request.form.get("ignore_comments"))
@@ -164,85 +121,81 @@ def index():
     unique_only = bool(request.form.get("unique_only"))
     sort_output = bool(request.form.get("sort_output"))
     keep_invalid = bool(request.form.get("keep_invalid"))
+
     filter_domain_raw = (request.form.get("filter_domain") or "").strip()
     filter_mode = request.form.get("filter_mode") or "endswith"
-    files = request.files.getlist("files")
-    if not files:
-        return render_template_string(PAGE)
-    total_lines = 0
-    valid = 0
-    invalid = 0
-    out_set = set()
-    out_list = []
-    for fs in files:
-        text = _read_text(fs)
-        for raw_line in text.splitlines():
-            total_lines += 1
-            line = raw_line
-            if trim_spaces:
-                line = line.strip()
-            if not line:
-                continue
-            if ignore_comments and (line.lstrip().startswith('#') or line.lstrip().startswith('//')):
-                continue
-            host = _extract_host(line)
-            if not host:
-                if keep_invalid:
-                    out_list.append(raw_line)
-                    invalid += 1
-                continue
-            if to_lower:
-                host = host.lower()
-            if not _is_valid_domain(host):
-                if keep_invalid:
-                    out_list.append(host)
-                    invalid += 1
-                continue
-            if keep_root:
-                ext = tldextract.extract(host)
-                root = ext.registered_domain
-                if root:
-                    host = root
-            valid += 1
-            if unique_only:
-                if host not in out_set:
-                    out_set.add(host)
-                    out_list.append(host)
-            else:
-                out_list.append(host)
-    matched_count = None
-    if filter_domain_raw:
-        filt = filter_domain_raw.strip().lower() if to_lower else filter_domain_raw.strip()
-        def _match(h: str) -> bool:
-            if filter_mode == "exact":
-                return h == filt
-            return h == filt or h.endswith("." + filt)
-        filtered = [h for h in out_list if _match(h)]
-        matched_count = len(filtered)
-        out_list = filtered
+
+    seen = set()
+    total_lines = valid = invalid = matched_count = 0
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, mode="w", encoding="utf-8")
+    try:
+        for fs in request.files.getlist("files"):
+            for raw_line in fs.stream:
+                total_lines += 1
+                try:
+                    line = raw_line.decode("utf-8", errors="replace")
+                except:
+                    continue
+                if trim_spaces:
+                    line = line.strip()
+                if not line:
+                    continue
+                if ignore_comments and (line.lstrip().startswith("#") or line.lstrip().startswith("//")):
+                    continue
+                host = extract_host(line)
+                if to_lower and host:
+                    host = host.lower()
+                if not host or not is_valid_domain(host):
+                    if keep_invalid:
+                        tmp.write(line + "\n")
+                        invalid += 1
+                    continue
+                if keep_root:
+                    ext = tldextract.extract(host)
+                    if ext.registered_domain:
+                        host = ext.registered_domain
+                # filter
+                if filter_domain_raw:
+                    filt = filter_domain_raw.lower() if to_lower else filter_domain_raw
+                    if filter_mode == "exact":
+                        if host != filt: continue
+                    else:
+                        if not (host == filt or host.endswith("." + filt)): continue
+                valid += 1
+                if unique_only:
+                    if host in seen:
+                        continue
+                    seen.add(host)
+                tmp.write(host + "\n")
+        tmp.flush()
+    finally:
+        tmp.close()
+
     if sort_output:
-        out_list = sorted(out_list)
-    output_text = "\n".join(out_list)
-    _LAST_RESULT = output_text.encode("utf-8")
+        with open(tmp.name, "r", encoding="utf-8") as f:
+            lines = sorted(set(line.strip() for line in f if line.strip()))
+        with open(tmp.name, "w", encoding="utf-8") as f:
+            for l in lines:
+                f.write(l + "\n")
+
+    LAST_RESULT_FILE = tmp.name
     stats = {
-        "files": len(files),
+        "files": len(request.files.getlist("files")),
         "total_lines": total_lines,
         "valid": valid,
-        "invalid": invalid if keep_invalid else 0,
-        "unique": len(set(out_list)) if (unique_only or sort_output) else '—',
-        "matched": matched_count if matched_count is not None else '—',
+        "invalid": invalid,
+        "matched": matched_count if matched_count else valid,
+        "unique": len(seen) if unique_only else "—"
     }
     return render_template_string(PAGE, stats=stats)
 
-
-@app.get("/download")
+@app.route("/download")
 def download():
-    global _LAST_RESULT
-    if not _LAST_RESULT:
-        return "No result to download — run the process first.", 400
-    buf = BytesIO(_LAST_RESULT)
-    return send_file(buf, as_attachment=True, download_name="domains.txt", mimetype="text/plain; charset=utf-8")
-
+    global LAST_RESULT_FILE
+    if not LAST_RESULT_FILE or not os.path.exists(LAST_RESULT_FILE):
+        return "No result to download", 400
+    return send_file(LAST_RESULT_FILE, as_attachment=True, download_name="domains.txt")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
