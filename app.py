@@ -88,4 +88,161 @@ PAGE = """
 </html>
 """
 
-# (rest of the Python backend remains as updated in previous step, with filter logic)
+HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
+
+
+def _read_text(file_storage, try_encodings=("utf-8", "utf-8-sig", "cp1256", "latin-1")):
+    data = file_storage.read()
+    try:
+        file_storage.seek(0)
+    except Exception:
+        pass
+    for enc in try_encodings:
+        try:
+            return data.decode(enc)
+        except Exception:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _extract_host(token: str) -> str | None:
+    s = token.strip()
+    if not s:
+        return None
+    if "://" in s:
+        try:
+            parts = urlsplit(s)
+            host = parts.hostname
+        except Exception:
+            host = None
+    else:
+        host = s.split()[0]
+        for ch in ["/", "?", "#", ":", "\\"]:
+            host = host.split(ch)[0]
+    if not host:
+        return None
+    if "@" in host:
+        host = host.split("@")[-1]
+    host = host.strip("[]")
+    if host.lower().startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _is_valid_domain(host: str) -> bool:
+    if not HOST_RE.match(host):
+        return False
+    if host.startswith('.') or host.endswith('.'):
+        return False
+    if '..' in host:
+        return False
+    if '.' not in host:
+        return False
+    try:
+        idna.encode(host)
+        return True
+    except Exception:
+        return False
+
+
+_LAST_RESULT: bytes | None = None
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}, 200
+
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    global _LAST_RESULT
+    if request.method == "GET":
+        return render_template_string(PAGE)
+    to_lower = bool(request.form.get("to_lower"))
+    trim_spaces = bool(request.form.get("trim_spaces"))
+    ignore_comments = bool(request.form.get("ignore_comments"))
+    keep_root = bool(request.form.get("keep_root"))
+    unique_only = bool(request.form.get("unique_only"))
+    sort_output = bool(request.form.get("sort_output"))
+    keep_invalid = bool(request.form.get("keep_invalid"))
+    filter_domain_raw = (request.form.get("filter_domain") or "").strip()
+    filter_mode = request.form.get("filter_mode") or "endswith"
+    files = request.files.getlist("files")
+    if not files:
+        return render_template_string(PAGE)
+    total_lines = 0
+    valid = 0
+    invalid = 0
+    out_set = set()
+    out_list = []
+    for fs in files:
+        text = _read_text(fs)
+        for raw_line in text.splitlines():
+            total_lines += 1
+            line = raw_line
+            if trim_spaces:
+                line = line.strip()
+            if not line:
+                continue
+            if ignore_comments and (line.lstrip().startswith('#') or line.lstrip().startswith('//')):
+                continue
+            host = _extract_host(line)
+            if not host:
+                if keep_invalid:
+                    out_list.append(raw_line)
+                    invalid += 1
+                continue
+            if to_lower:
+                host = host.lower()
+            if not _is_valid_domain(host):
+                if keep_invalid:
+                    out_list.append(host)
+                    invalid += 1
+                continue
+            if keep_root:
+                ext = tldextract.extract(host)
+                root = ext.registered_domain
+                if root:
+                    host = root
+            valid += 1
+            if unique_only:
+                if host not in out_set:
+                    out_set.add(host)
+                    out_list.append(host)
+            else:
+                out_list.append(host)
+    matched_count = None
+    if filter_domain_raw:
+        filt = filter_domain_raw.strip().lower() if to_lower else filter_domain_raw.strip()
+        def _match(h: str) -> bool:
+            if filter_mode == "exact":
+                return h == filt
+            return h == filt or h.endswith("." + filt)
+        filtered = [h for h in out_list if _match(h)]
+        matched_count = len(filtered)
+        out_list = filtered
+    if sort_output:
+        out_list = sorted(out_list)
+    output_text = "\n".join(out_list)
+    _LAST_RESULT = output_text.encode("utf-8")
+    stats = {
+        "files": len(files),
+        "total_lines": total_lines,
+        "valid": valid,
+        "invalid": invalid if keep_invalid else 0,
+        "unique": len(set(out_list)) if (unique_only or sort_output) else '—',
+        "matched": matched_count if matched_count is not None else '—',
+    }
+    return render_template_string(PAGE, stats=stats)
+
+
+@app.get("/download")
+def download():
+    global _LAST_RESULT
+    if not _LAST_RESULT:
+        return "No result to download — run the process first.", 400
+    buf = BytesIO(_LAST_RESULT)
+    return send_file(buf, as_attachment=True, download_name="domains.txt", mimetype="text/plain; charset=utf-8")
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
